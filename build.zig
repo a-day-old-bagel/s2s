@@ -4,12 +4,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
-    _ = b.addModule("s2s", .{
-        .root_source_file = .{ .path = "s2s.zig" },
+    const s2s = b.addModule("s2s", .{
+        .root_source_file = b.path("s2s.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    _ = s2s;
 
     const tests = b.addTest(.{
-        .root_source_file = .{ .path = "s2s.zig" },
+        .root_source_file = b.path("s2s.zig"),
         .target = target,
         .optimize = optimize,
     });

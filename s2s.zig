@@ -79,7 +79,6 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
             }
         },
         .Pointer => |ptr| {
-            if (ptr.sentinel != null) @compileError("Sentinels are not supported yet!");
             switch (ptr.size) {
                 .One => try serializeRecursive(stream, ptr.child, value.*),
                 .Slice => {
@@ -104,7 +103,6 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
                     try serializeRecursive(stream, arr.child, item);
                 }
             }
-            if (arr.sentinel != null) @compileError("Sentinels are not supported yet!");
         },
         .Struct => |str| {
             // we can safely ignore the struct layout here as we will serialize the data by field order,
@@ -228,7 +226,6 @@ fn recursiveDeserialize(
             @truncate(try stream.readInt(AlignedInt(T), .little)),
 
         .Pointer => |ptr| {
-            if (ptr.sentinel != null) @compileError("Sentinels are not supported yet!");
             switch (ptr.size) {
                 .One => {
                     const pointer = try allocator.?.create(ptr.child);
@@ -241,7 +238,7 @@ fn recursiveDeserialize(
                 .Slice => {
                     const length = std.math.cast(usize, try stream.readInt(u64, .little)) orelse return error.UnexpectedData;
 
-                    const slice = try allocator.?.alloc(ptr.child, length);
+                    const slice = try allocator.?.alloc(ptr.child, length + if (ptr.sentinel != null) 1 else 0);
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {
@@ -250,6 +247,11 @@ fn recursiveDeserialize(
                         for (slice) |*item| {
                             try recursiveDeserialize(stream, ptr.child, allocator, item);
                         }
+                    }
+
+                    if (ptr.sentinel) |_sentinel| {
+                        // There is a sentinel, append it.
+                        slice[length] = _sentinel;
                     }
 
                     target.* = slice;
@@ -544,7 +546,7 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
         },
         .Pointer => |ptr| {
             if (ptr.is_volatile) @compileError("Serializing volatile pointers is most likely a mistake.");
-            if (ptr.sentinel != null) @compileError("Sentinels are not supported yet!");
+            if (ptr.sentinel != null and ptr.child != u8) @compileError("Sentinels other than u8 are not supported yet!");
             switch (ptr.size) {
                 .One => {
                     hasher.update("pointer");
@@ -552,6 +554,10 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
                 },
                 .Slice => {
                     hasher.update("slice");
+                    if (ptr.sentinel) |_sentinel| {
+                        const sentinelHash: *const u8 = @ptrCast(@alignCast(_sentinel));
+                        hasher.update(&[_]u8{sentinelHash.*});
+                    }
                     computeTypeHashInternal(hasher, ptr.child);
                 },
                 .C => @compileError("C-pointers are not supported"),
@@ -559,8 +565,11 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
             }
         },
         .Array => |arr| {
-            if (arr.sentinel != null) @compileError("Sentinels are not supported yet!");
             hasher.update(&intToLittleEndianBytes(@as(u64, arr.len)));
+            if (arr.sentinel) |_sentinel| {
+                const sentinelHash: *const u8 = @ptrCast(@alignCast(_sentinel));
+                hasher.update(&[_]u8{sentinelHash.*});
+            }
             computeTypeHashInternal(hasher, arr.child);
         },
         .Struct => |str| {
@@ -679,6 +688,7 @@ test "type hasher basics" {
     testSameHash([]const u8, []const u8);
     testSameHash([]const u8, []u8);
     testSameHash([]const u8, []u8);
+    testSameHash([:0]const u8, [:0]u8);
     testSameHash(?*struct { a: f32, b: u16 }, ?*const struct { hello: f32, lol: u16 });
     testSameHash(enum { a, b, c }, enum { a, b, c });
     testSameHash(enum(u8) { a, b, c, _ }, enum(u8) { c, b, a, _ });

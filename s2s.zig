@@ -238,7 +238,15 @@ fn recursiveDeserialize(
                 .Slice => {
                     const length = std.math.cast(usize, try stream.readInt(u64, .little)) orelse return error.UnexpectedData;
 
-                    const slice = try allocator.?.alloc(ptr.child, length + if (ptr.sentinel != null) 1 else 0);
+                    const slice = blk: {
+                        if (ptr.sentinel) |_sentinel| {
+                            // There is a sentinel, append it.
+                            const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
+                            break :blk try allocator.?.allocSentinel(ptr.child, length, typedSentinel.*);
+                        } else {
+                            break :blk try allocator.?.alloc(ptr.child, length + if (ptr.sentinel != null) 1 else 0);
+                        }
+                    };
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {

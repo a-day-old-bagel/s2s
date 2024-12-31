@@ -251,7 +251,8 @@ fn recursiveDeserialize(
 
                     if (ptr.sentinel) |_sentinel| {
                         // There is a sentinel, append it.
-                        slice[length] = _sentinel;
+                        const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
+                        slice[length] = typedSentinel.*;
                     }
 
                     target.* = slice;
@@ -263,6 +264,11 @@ fn recursiveDeserialize(
         .Array => |arr| {
             if (arr.child == u8) {
                 try stream.readNoEof(target);
+                if (arr.sentinel) |_sentinel| {
+                    // There is a sentinel, append it.
+                    const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
+                    target[arr.len - 1] = typedSentinel.*;
+                }
             } else {
                 for (&target.*) |*item| {
                     try recursiveDeserialize(stream, arr.child, allocator, item);

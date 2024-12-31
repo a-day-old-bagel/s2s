@@ -250,7 +250,7 @@ fn recursiveDeserialize(
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {
-                        try stream.readNoEof(slice);
+                        try stream.readNoEof(slice[0..length]);
                     } else {
                         for (slice) |*item| {
                             try recursiveDeserialize(stream, ptr.child, allocator, item);
@@ -271,7 +271,7 @@ fn recursiveDeserialize(
         },
         .Array => |arr| {
             if (arr.child == u8) {
-                try stream.readNoEof(target);
+                try stream.readNoEof(target[0..if (arr.sentinel != null) arr.len - 1 else arr.len]);
                 if (arr.sentinel) |_sentinel| {
                     // There is a sentinel, append it.
                     const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));

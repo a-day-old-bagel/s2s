@@ -84,7 +84,7 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
                 .Slice => {
                     try stream.writeInt(u64, value.len, .little);
                     if (ptr.child == u8) {
-                        try stream.writeAll(if (ptr.sentinel != null) value[0..value.len - 1] else value);
+                        try stream.writeAll(value);
                     } else {
                         for (value) |item| {
                             try serializeRecursive(stream, ptr.child, item);
@@ -97,7 +97,7 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
         },
         .Array => |arr| {
             if (arr.child == u8) {
-                try stream.writeAll(if (arr.sentinel != null) value[0..value.len - 1] else &value);
+                try stream.writeAll(&value);
             } else {
                 for (value) |item| {
                     try serializeRecursive(stream, arr.child, item);
@@ -244,23 +244,17 @@ fn recursiveDeserialize(
                             const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
                             break :blk try allocator.?.allocSentinel(ptr.child, length, typedSentinel.*);
                         } else {
-                            break :blk try allocator.?.alloc(ptr.child, length + if (ptr.sentinel != null) 1 else 0);
+                            break :blk try allocator.?.alloc(ptr.child, length);
                         }
                     };
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {
-                        try stream.readNoEof(slice[0..length]);
+                        try stream.readNoEof(slice);
                     } else {
                         for (slice) |*item| {
                             try recursiveDeserialize(stream, ptr.child, allocator, item);
                         }
-                    }
-
-                    if (ptr.sentinel) |_sentinel| {
-                        // There is a sentinel, append it.
-                        const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
-                        slice[length] = typedSentinel.*;
                     }
 
                     target.* = slice;
@@ -271,12 +265,7 @@ fn recursiveDeserialize(
         },
         .Array => |arr| {
             if (arr.child == u8) {
-                try stream.readNoEof(target[0..if (arr.sentinel != null) arr.len - 1 else arr.len]);
-                if (arr.sentinel) |_sentinel| {
-                    // There is a sentinel, append it.
-                    const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
-                    target[arr.len - 1] = typedSentinel.*;
-                }
+                try stream.readNoEof(target);
             } else {
                 for (&target.*) |*item| {
                     try recursiveDeserialize(stream, arr.child, allocator, item);
@@ -372,12 +361,12 @@ fn recursiveDeserialize(
     }
 }
 
-fn makeMutableSlice(comptime T: type, slice: []const T) []T {
+fn makeMutableSlice(comptime T: type, slice: []const T, comptime withSentinel: bool) []T {
     if (slice.len == 0) {
-        var buf: [0]T = .{};
+        var buf: [if (withSentinel) 1 else 0]T = if (withSentinel) .{undefined} else .{};
         return &buf;
     } else {
-        return @as([*]T, @constCast(slice.ptr))[0..slice.len];
+        return @as([*]T, @constCast(slice.ptr))[0..slice.len + (if (withSentinel) 1 else 0)];
     }
 }
 
@@ -395,7 +384,7 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
                     allocator.destroy(mut_ptr);
                 },
                 .Slice => {
-                    const mut_slice = makeMutableSlice(ptr.child, value.*);
+                    const mut_slice = makeMutableSlice(ptr.child, value.*, ptr.sentinel != null);
                     for (mut_slice) |*item| {
                         recursiveFree(allocator, ptr.child, item);
                     }
@@ -750,6 +739,10 @@ test "serialize basics" {
     try testSerialize([]const u8, "Hello, World!");
     try testSerialize(*const [3]u8, "foo");
 
+    try testSerialize([3:0]u8, "hi!".*);
+    try testSerialize([:0]const u8, "Hello, World!");
+    try testSerialize(*const [3:0]u8, "foo");
+
     try testSerialize(enum { a, b, c }, .a);
     try testSerialize(enum { a, b, c }, .b);
     try testSerialize(enum { a, b, c }, .c);
@@ -846,6 +839,10 @@ test "ser/des" {
     try testSerDesAlloc([3]u8, "hi!".*);
     try testSerDesSliceContentEquality([]const u8, "Hello, World!");
     try testSerDesPtrContentEquality(*const [3]u8, "foo");
+
+    try testSerDesAlloc([3:0]u8, "hi!".*);
+    try testSerDesSliceContentEquality([:0]const u8, "Hello, World!");
+    try testSerDesPtrContentEquality(*const [3:0]u8, "foo");
 
     try testSerDesAlloc(enum { a, b, c }, .a);
     try testSerDesAlloc(enum { a, b, c }, .b);

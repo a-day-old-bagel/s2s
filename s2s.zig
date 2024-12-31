@@ -84,7 +84,7 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
                 .Slice => {
                     try stream.writeInt(u64, value.len, .little);
                     if (ptr.child == u8) {
-                        try stream.writeAll(value);
+                        try stream.writeAll(if (ptr.sentinel != null) value[0..value.len - 1] else value);
                     } else {
                         for (value) |item| {
                             try serializeRecursive(stream, ptr.child, item);
@@ -97,7 +97,7 @@ fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(strea
         },
         .Array => |arr| {
             if (arr.child == u8) {
-                try stream.writeAll(&value);
+                try stream.writeAll(if (arr.sentinel != null) value[0..value.len - 1] else &value);
             } else {
                 for (value) |item| {
                     try serializeRecursive(stream, arr.child, item);

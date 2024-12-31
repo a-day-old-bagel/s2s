@@ -20,6 +20,14 @@ A Zig binary serialization format and library.
 - Function pointers
 - Frames
 
+## Madeorsk's fork
+
+This is a fork from [`ziglibs/s2s`](https://github.com/ziglibs/s2s) which provides more features for real-world usage.
+
+- Usable with zig's dependency manager.
+- Support `[]u8` with sentinels.
+- Support hash maps.
+
 ## API
 
 The library itself provides only some APIs, as most of the serialization process is not configurable.
@@ -54,14 +62,21 @@ fn free(allocator: std.mem.Allocator, comptime T: type, value: T) void;
 
 ### Adding the library
 
-Just add the `s2s.zig` as a package to your Zig project. It has no external dependencies.
-
-### Running the test suite
+The current latest version is 0.3.0 for zig 0.13.0.
 
 ```sh-session
-[user@host s2s]$ zig test s2s.zig
-All 3 tests passed.
-[user@host s2s]$
+[user@host s2s]$ zig fetch --save git+https://github.com/madeorsk/s2s#v0.3.0
+```
+
+In `build.zig`.
+
+```zig
+// Add s2s dependency.
+const s2s = b.dependency("s2s", .{
+	.target = target,
+	.optimize = optimize,
+});
+exe.root_module.addImport("s2s", s2s.module("s2s"));
 ```
 
 ## Project Status

@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const options = @import("s2s_options");
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Public API:
@@ -10,9 +11,12 @@ const testing = std.testing;
 /// - `value` is the instance to serialize.
 pub fn serialize(stream: anytype, comptime T: type, value: T) @TypeOf(stream).Error!void {
     comptime validateTopLevelType(T);
-    const type_hash = comptime computeTypeHash(T);
 
-    try stream.writeAll(type_hash[0..]);
+    if (!options.skip_runtime_type_validation) {
+        const type_hash = comptime computeTypeHash(T);
+        try stream.writeAll(type_hash[0..]);
+    }
+
     try serializeRecursive(stream, T, value);
 }
 
@@ -222,12 +226,14 @@ fn deserializeInternal(
     comptime T: type,
     allocator: ?std.mem.Allocator,
 ) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
-    const type_hash = comptime computeTypeHash(T);
 
-    var ref_hash: [type_hash.len]u8 = undefined;
-    try stream.readNoEof(&ref_hash);
-    if (!std.mem.eql(u8, type_hash[0..], ref_hash[0..]))
-        return error.UnexpectedData;
+    if (!options.skip_runtime_type_validation) {
+        const type_hash = comptime computeTypeHash(T);
+        var ref_hash: [type_hash.len]u8 = undefined;
+        try stream.readNoEof(&ref_hash);
+        if (!std.mem.eql(u8, type_hash[0..], ref_hash[0..]))
+            return error.UnexpectedData;
+    }
 
     var result: T = undefined;
     try recursiveDeserialize(stream, T, allocator, &result);

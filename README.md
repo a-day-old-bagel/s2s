@@ -30,7 +30,11 @@ This is a fork from [`ziglibs/s2s`](https://github.com/ziglibs/s2s) which provid
 
 ## adayoldbagel's fork
 
-This re-merges Madeorsk's feature additions with the original repo's latest updates.
+This fork re-merges Madeorsk's feature additions with the original repo's latest updates.
+It also adds a build option to skip runtime type hashing and validation, which shrinks the serialized stream.
+These shrunken streams are currently not compatible with builds of s2s that do include the type hashing.
+Some other compression techniques are tentatively planned as well.
+Incompatibilities in streams may later be solved with some sort of stream metadata header.
 
 ## API
 

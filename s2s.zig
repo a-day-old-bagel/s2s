@@ -9,7 +9,11 @@ const options = @import("s2s_options");
 /// - `stream` is a instance of `std.io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
-pub fn serialize(stream: anytype, comptime T: type, value: T) @TypeOf(stream).Error!void {
+pub fn serialize(
+    stream: anytype,
+    comptime T: type,
+    value: T,
+) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     comptime validateTopLevelType(T);
 
     if (!options.skip_runtime_type_validation) {
@@ -72,9 +76,15 @@ fn findHashMapEntryType(comptime T: type) ?type {
 }
 
 /// Serialize an unmanaged hash map.
-fn serializeMap(stream: anytype, comptime T: type, value: T) @TypeOf(stream).Error!void {
+fn serializeMap(stream: anytype, comptime T: type, value: T) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     // Serialize the map size.
-    try serializeRecursive(stream, u32, value.size);
+    if (@hasField(T, "size")) {
+        try serializeRecursive(stream, u32, value.size);
+    } else if (@hasDecl(T, "count")) {
+        if (value.count() > std.math.maxInt(u32)) return error.MapTooLarge;
+        try serializeRecursive(stream, u32, @as(u32, @intCast(value.count())));
+    } else @compileError("unsupported map type");
+
     // Serialize each entry.
     var iterator = value.iterator();
     while (iterator.next()) |entry| {
@@ -82,7 +92,11 @@ fn serializeMap(stream: anytype, comptime T: type, value: T) @TypeOf(stream).Err
     }
 }
 
-fn serializeRecursive(stream: anytype, comptime T: type, value: T) @TypeOf(stream).Error!void {
+fn serializeRecursive(
+    stream: anytype,
+    comptime T: type,
+    value: T,
+) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
         .void => {}, // no data

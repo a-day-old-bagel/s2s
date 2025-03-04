@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tests.root_module.addImport("s2s_options", options_module);
 
     const test_step = b.step("test", "Run unit tests");
     const run_test = b.addRunArtifact(tests);

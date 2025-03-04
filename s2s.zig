@@ -5,14 +5,22 @@ const options = @import("s2s_options");
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Public API:
 
+/// Options given to (de)serialize functions
+/// - 'override_fn' is a function name. If any struct has a function named this, (de)serialization will call it instead.
+pub const Options = struct {
+    override_fn: []const u8 = "",
+};
+
 /// Serializes the given `value: T` into the `stream`.
 /// - `stream` is a instance of `std.io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
+/// - 'opt' contains optional features
 pub fn serialize(
     stream: anytype,
     comptime T: type,
     value: T,
+    comptime opt: Options,
 ) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     comptime validateTopLevelType(T);
 
@@ -21,20 +29,22 @@ pub fn serialize(
         try stream.writeAll(type_hash[0..]);
     }
 
-    try serializeRecursive(stream, T, value);
+    try serializeRecursive(stream, T, value, opt);
 }
 
 /// Deserializes a value of type `T` from the `stream`.
 /// - `stream` is a instance of `std.io.Reader`
 /// - `T` is the type to deserialize
+/// - 'opt' contains optional features
 pub fn deserialize(
     stream: anytype,
     comptime T: type,
+    comptime opt: Options,
 ) (@TypeOf(stream).Error || error{ UnexpectedData, EndOfStream })!T {
     comptime validateTopLevelType(T);
-    if (comptime requiresAllocationForDeserialize(T))
+    if (comptime requiresAllocationForDeserialize(T, opt))
         @compileError(@typeName(T) ++ " requires allocation to be deserialized. Use deserializeAlloc instead of deserialize!");
-    return deserializeInternal(stream, T, null) catch |err| switch (err) {
+    return deserializeInternal(stream, T, null, opt) catch |err| switch (err) {
         error.OutOfMemory => unreachable,
         else => |e| return e,
     };
@@ -45,13 +55,14 @@ pub fn deserialize(
 /// - `T` is the type to deserialize
 /// - `allocator` is an allocator require to allocate slices and pointers.
 /// Result must be freed by using `free()`.
+/// Custom override functions not yet supported for this case.
 pub fn deserializeAlloc(
     stream: anytype,
     comptime T: type,
     allocator: std.mem.Allocator,
 ) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
     comptime validateTopLevelType(T);
-    return try deserializeInternal(stream, T, allocator);
+    return try deserializeInternal(stream, T, allocator, .{});
 }
 
 /// Releases all memory allocated by `deserializeAlloc`.
@@ -76,19 +87,24 @@ fn findHashMapEntryType(comptime T: type) ?type {
 }
 
 /// Serialize an unmanaged hash map.
-fn serializeMap(stream: anytype, comptime T: type, value: T) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
+fn serializeMap(
+    stream: anytype,
+    comptime T: type,
+    value: T,
+    comptime opt: Options,
+) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     // Serialize the map size.
     if (@hasField(T, "size")) {
-        try serializeRecursive(stream, u32, value.size);
+        try serializeRecursive(stream, u32, value.size, opt);
     } else if (@hasDecl(T, "count")) {
         if (value.count() > std.math.maxInt(u32)) return error.MapTooLarge;
-        try serializeRecursive(stream, u32, @as(u32, @intCast(value.count())));
+        try serializeRecursive(stream, u32, @as(u32, @intCast(value.count())), opt);
     } else @compileError("unsupported map type");
 
     // Serialize each entry.
     var iterator = value.iterator();
     while (iterator.next()) |entry| {
-        try serializeRecursive(stream, T.Entry, entry);
+        try serializeRecursive(stream, T.Entry, entry, opt);
     }
 }
 
@@ -96,6 +112,7 @@ fn serializeRecursive(
     stream: anytype,
     comptime T: type,
     value: T,
+    comptime opt: Options,
 ) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
@@ -119,14 +136,14 @@ fn serializeRecursive(
         },
         .pointer => |ptr| {
             switch (ptr.size) {
-                .One => try serializeRecursive(stream, ptr.child, value.*),
+                .One => try serializeRecursive(stream, ptr.child, value.*, opt),
                 .Slice => {
                     try stream.writeInt(u64, value.len, .little);
                     if (ptr.child == u8) {
                         try stream.writeAll(value);
                     } else {
                         for (value) |item| {
-                            try serializeRecursive(stream, ptr.child, item);
+                            try serializeRecursive(stream, ptr.child, item, opt);
                         }
                     }
                 },
@@ -139,23 +156,28 @@ fn serializeRecursive(
                 try stream.writeAll(&value);
             } else {
                 for (value) |item| {
-                    try serializeRecursive(stream, arr.child, item);
+                    try serializeRecursive(stream, arr.child, item, opt);
                 }
             }
         },
         .@"struct" => |str| {
+            if (opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) {
+                try @field(T, opt.override_fn)(value, stream);
+                return;
+            }
+
             // Try to detect a structure like std.HashMapUnmanaged(T).
             if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
                 // Try to serialize an unmanaged hash map type from the unmanaged field.
                 if (comptime findHashMapEntryType(std.meta.fields(T)[unmanagedField].type) != null) {
-                    try serializeMap(stream, std.meta.fields(T)[unmanagedField].type, value.unmanaged);
+                    try serializeMap(stream, std.meta.fields(T)[unmanagedField].type, value.unmanaged, opt);
                     // Serialized the map type, nothing more to do.
                     return;
                 }
             } else {
                 // Try to serialize the provided type as an unmanaged hash map type.
                 if (comptime findHashMapEntryType(T) != null) {
-                    try serializeMap(stream, T, value.unmanaged);
+                    try serializeMap(stream, T, value.unmanaged, opt);
                     // Serialized the map type, nothing more to do.
                     return;
                 }
@@ -165,13 +187,13 @@ fn serializeRecursive(
             // instead of memory representation
 
             inline for (str.fields) |fld| {
-                try serializeRecursive(stream, fld.type, @field(value, fld.name));
+                try serializeRecursive(stream, fld.type, @field(value, fld.name), opt);
             }
         },
-        .optional => |opt| {
+        .optional => |optional| {
             if (value) |item| {
                 try stream.writeInt(u8, 1, .little);
-                try serializeRecursive(stream, opt.child, item);
+                try serializeRecursive(stream, optional.child, item, opt);
             } else {
                 try stream.writeInt(u8, 0, .little);
             }
@@ -179,10 +201,10 @@ fn serializeRecursive(
         .error_union => |eu| {
             if (value) |item| {
                 try stream.writeInt(u8, 1, .little);
-                try serializeRecursive(stream, eu.payload, item);
+                try serializeRecursive(stream, eu.payload, item, opt);
             } else |item| {
                 try stream.writeInt(u8, 0, .little);
-                try serializeRecursive(stream, eu.error_set, item);
+                try serializeRecursive(stream, eu.error_set, item, opt);
             }
         },
         .error_set => {
@@ -206,17 +228,17 @@ fn serializeRecursive(
 
             const active_tag = std.meta.activeTag(value);
 
-            try serializeRecursive(stream, Tag, active_tag);
+            try serializeRecursive(stream, Tag, active_tag, opt);
 
             inline for (std.meta.fields(T)) |fld| {
                 if (@field(Tag, fld.name) == active_tag) {
-                    try serializeRecursive(stream, fld.type, @field(value, fld.name));
+                    try serializeRecursive(stream, fld.type, @field(value, fld.name), opt);
                 }
             }
         },
         .vector => |vec| {
             const array: [vec.len]vec.child = value;
-            try serializeRecursive(stream, @TypeOf(array), array);
+            try serializeRecursive(stream, @TypeOf(array), array, opt);
         },
 
         // Unsupported types:
@@ -239,6 +261,7 @@ fn deserializeInternal(
     stream: anytype,
     comptime T: type,
     allocator: ?std.mem.Allocator,
+    comptime opt: Options,
 ) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
 
     if (!options.skip_runtime_type_validation) {
@@ -250,7 +273,7 @@ fn deserializeInternal(
     }
 
     var result: T = undefined;
-    try recursiveDeserialize(stream, T, allocator, &result);
+    try recursiveDeserialize(stream, T, allocator, &result, opt);
     return result;
 }
 
@@ -259,7 +282,14 @@ fn AlignedInt(comptime T: type) type {
     return std.math.ByteAlignedInt(T);
 }
 
-fn deserializeMap(stream: anytype, comptime T: type, comptime EntryType: type, allocator: ?std.mem.Allocator, target: *T) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
+fn deserializeMap(
+    stream: anytype,
+    comptime T: type,
+    comptime EntryType: type,
+    allocator: ?std.mem.Allocator,
+    target: *T,
+    comptime opt: Options,
+) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     // Initialize the map.
     target.* = T.init(allocator.?);
 
@@ -276,7 +306,7 @@ fn deserializeMap(stream: anytype, comptime T: type, comptime EntryType: type, a
     for (0..size) |_| {
         // Deserialize each entry and put it in the map.
         var entry: EntryType = undefined;
-        try recursiveDeserialize(stream, EntryType, allocator, &entry);
+        try recursiveDeserialize(stream, EntryType, allocator, &entry, opt);
         defer {
             allocator.?.destroy(entry.key_ptr);
             allocator.?.destroy(entry.value_ptr);
@@ -290,6 +320,7 @@ fn recursiveDeserialize(
     comptime T: type,
     allocator: ?std.mem.Allocator,
     target: *T,
+    comptime opt: Options,
 ) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
@@ -315,7 +346,7 @@ fn recursiveDeserialize(
                     const pointer = try allocator.?.create(ptr.child);
                     errdefer allocator.?.destroy(pointer);
 
-                    try recursiveDeserialize(stream, ptr.child, allocator, pointer);
+                    try recursiveDeserialize(stream, ptr.child, allocator, pointer, opt);
 
                     target.* = pointer;
                 },
@@ -337,7 +368,7 @@ fn recursiveDeserialize(
                         try stream.readNoEof(slice);
                     } else {
                         for (slice) |*item| {
-                            try recursiveDeserialize(stream, ptr.child, allocator, item);
+                            try recursiveDeserialize(stream, ptr.child, allocator, item, opt);
                         }
                     }
 
@@ -352,23 +383,28 @@ fn recursiveDeserialize(
                 try stream.readNoEof(target);
             } else {
                 for (&target.*) |*item| {
-                    try recursiveDeserialize(stream, arr.child, allocator, item);
+                    try recursiveDeserialize(stream, arr.child, allocator, item, opt);
                 }
             }
         },
         .@"struct" => |str| {
+            if (opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) {
+                target.* = try @field(T, opt.override_fn)(stream);
+                return;
+            }
+
             // Try to detect a structure like std.HashMapUnmanaged(T).
             if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
                 // Try to deserialize an unmanaged hash map type from the unmanaged field.
                 if (comptime findHashMapEntryType(std.meta.fields(T)[unmanagedField].type)) |EntryType| {
-                    try deserializeMap(stream, T, EntryType, allocator, target);
+                    try deserializeMap(stream, T, EntryType, allocator, target, opt);
                     // Deserialized the map type, nothing more to do.
                     return;
                 }
             } else {
                 // Try to deserialize the provided type as an unmanaged hash map type.
                 if (comptime findHashMapEntryType(T)) |EntryType| {
-                    try deserializeMap(stream, T, EntryType, allocator, target);
+                    try deserializeMap(stream, T, EntryType, allocator, target, opt);
                     // Deserialized the map type, nothing more to do.
                     return;
                 }
@@ -378,15 +414,15 @@ fn recursiveDeserialize(
             // instead of memory representation
 
             inline for (str.fields) |fld| {
-                try recursiveDeserialize(stream, fld.type, allocator, &@field(target.*, fld.name));
+                try recursiveDeserialize(stream, fld.type, allocator, &@field(target.*, fld.name), opt);
             }
         },
-        .optional => |opt| {
+        .optional => |optional| {
             const is_set = try stream.readInt(u8, .little);
 
             if (is_set != 0) {
-                target.* = @as(opt.child, undefined);
-                try recursiveDeserialize(stream, opt.child, allocator, &target.*.?);
+                target.* = @as(optional.child, undefined);
+                try recursiveDeserialize(stream, optional.child, allocator, &target.*.?, opt);
             } else {
                 target.* = null;
             }
@@ -395,11 +431,11 @@ fn recursiveDeserialize(
             const is_value = try stream.readInt(u8, .little);
             if (is_value != 0) {
                 var value: eu.payload = undefined;
-                try recursiveDeserialize(stream, eu.payload, allocator, &value);
+                try recursiveDeserialize(stream, eu.payload, allocator, &value, opt);
                 target.* = value;
             } else {
                 var err: eu.error_set = undefined;
-                try recursiveDeserialize(stream, eu.error_set, allocator, &err);
+                try recursiveDeserialize(stream, eu.error_set, allocator, &err, opt);
                 target.* = err;
             }
         },
@@ -427,12 +463,12 @@ fn recursiveDeserialize(
             const Tag = un.tag_type orelse @compileError("Untagged unions are not supported!");
 
             var active_tag: Tag = undefined;
-            try recursiveDeserialize(stream, Tag, allocator, &active_tag);
+            try recursiveDeserialize(stream, Tag, allocator, &active_tag, opt);
 
             inline for (std.meta.fields(T)) |fld| {
                 if (@field(Tag, fld.name) == active_tag) {
                     var union_value: fld.type = undefined;
-                    try recursiveDeserialize(stream, fld.type, allocator, &union_value);
+                    try recursiveDeserialize(stream, fld.type, allocator, &union_value, opt);
                     target.* = @unionInit(T, fld.name, union_value);
                     return;
                 }
@@ -442,7 +478,7 @@ fn recursiveDeserialize(
         },
         .vector => |vec| {
             var array: [vec.len]vec.child = undefined;
-            try recursiveDeserialize(stream, @TypeOf(array), allocator, &array);
+            try recursiveDeserialize(stream, @TypeOf(array), allocator, &array, opt);
             target.* = array;
         },
 
@@ -508,8 +544,8 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
                     // Free keys / values.
                     var iterator = value.iterator();
                     while (iterator.next()) |entry| {
-                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).Pointer.child, entry.key_ptr);
-                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).Pointer.child, entry.value_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).pointer.child, entry.key_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).pointer.child, entry.value_ptr);
                     }
                     value.deinit();
                     // Deinitialized the map type, nothing more to do.
@@ -521,8 +557,8 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
                     // Free keys / values.
                     var iterator = value.iterator();
                     while (iterator.next()) |entry| {
-                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).Pointer.child, entry.key_ptr);
-                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).Pointer.child, entry.value_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).pointer.child, entry.key_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).pointer.child, entry.value_ptr);
                     }
                     value.deinit();
                     // Deinitialized the map type, nothing more to do.
@@ -585,18 +621,19 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
 }
 
 /// Returns `true` if `T` requires allocation to be deserialized.
-fn requiresAllocationForDeserialize(comptime T: type) bool {
+fn requiresAllocationForDeserialize(comptime T: type, comptime opt: Options) bool {
+    if (@typeInfo(T) == .@"struct" and opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) return false;
     switch (@typeInfo(T)) {
         .pointer => return true,
         .@"struct", .@"union" => {
             inline for (comptime std.meta.fields(T)) |fld| {
-                if (requiresAllocationForDeserialize(fld.type)) {
+                if (requiresAllocationForDeserialize(fld.type, opt)) {
                     return true;
                 }
             }
             return false;
         },
-        .error_union => |eu| return requiresAllocationForDeserialize(eu.payload),
+        .error_union => |eu| return requiresAllocationForDeserialize(eu.payload, opt),
         else => return false,
     }
 }
@@ -876,7 +913,7 @@ fn testSerialize(comptime T: type, value: T) !void {
     var data = std.ArrayList(u8).init(std.testing.allocator);
     defer data.deinit();
 
-    try serialize(data.writer(), T, value);
+    try serialize(data.writer(), T, value, .{});
 }
 
 const enable_failing_test = false;
@@ -951,7 +988,7 @@ fn serDesAlloc(comptime T: type, value: T) !T {
     var data = std.ArrayList(u8).init(std.testing.allocator);
     defer data.deinit();
 
-    try serialize(data.writer(), T, value);
+    try serialize(data.writer(), T, value, .{});
 
     var stream = std.io.fixedBufferStream(data.items);
 
@@ -962,7 +999,7 @@ fn testSerDesAlloc(comptime T: type, value: T) !void {
     var data: std.ArrayList(u8) = .init(std.testing.allocator);
     defer data.deinit();
 
-    try serialize(data.writer(), T, value);
+    try serialize(data.writer(), T, value, .{});
 
     var stream = std.io.fixedBufferStream(data.items);
 
@@ -976,7 +1013,7 @@ fn testSerDesPtrContentEquality(comptime T: type, value: T) !void {
     var data = std.ArrayList(u8).init(std.testing.allocator);
     defer data.deinit();
 
-    try serialize(data.writer(), T, value);
+    try serialize(data.writer(), T, value, .{});
 
     var stream = std.io.fixedBufferStream(data.items);
 
@@ -990,7 +1027,7 @@ fn testSerDesSliceContentEquality(comptime T: type, value: T) !void {
     var data = std.ArrayList(u8).init(std.testing.allocator);
     defer data.deinit();
 
-    try serialize(data.writer(), T, value);
+    try serialize(data.writer(), T, value, .{});
 
     var stream = std.io.fixedBufferStream(data.items);
 

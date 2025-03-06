@@ -110,27 +110,6 @@ pub fn main() !void {
 }
 ```
 
-## Usage and Development
-
-### Adding the library
-
-The current latest version is 0.3.0 for zig 0.13.0.
-
-```sh-session
-[user@host s2s]$ zig fetch --save git+https://github.com/madeorsk/s2s#v0.3.0
-```
-
-In `build.zig`.
-
-```zig
-// Add s2s dependency.
-const s2s = b.dependency("s2s", .{
-	.target = target,
-	.optimize = optimize,
-});
-exe.root_module.addImport("s2s", s2s.module("s2s"));
-```
-
 ## Project Status
 
 Most of the serialization/deserialization is implemented for the _trivial_ case.

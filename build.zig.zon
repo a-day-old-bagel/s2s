@@ -1,6 +1,7 @@
 .{
     .name = .s2s,
     .version = "0.0.1",
+    .minimum_zig_version = "0.14.0",
     .fingerprint = 0x8d8a7bec8d1a1337,
     .dependencies = .{},
     .paths = .{

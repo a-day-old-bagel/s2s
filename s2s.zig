@@ -136,8 +136,8 @@ fn serializeRecursive(
         },
         .pointer => |ptr| {
             switch (ptr.size) {
-                .One => try serializeRecursive(stream, ptr.child, value.*, opt),
-                .Slice => {
+                .one => try serializeRecursive(stream, ptr.child, value.*, opt),
+                .slice => {
                     try stream.writeInt(u64, value.len, .little);
                     if (ptr.child == u8) {
                         try stream.writeAll(value);
@@ -147,8 +147,8 @@ fn serializeRecursive(
                         }
                     }
                 },
-                .C => unreachable,
-                .Many => unreachable,
+                .c => unreachable,
+                .many => unreachable,
             }
         },
         .array => |arr| {
@@ -342,7 +342,7 @@ fn recursiveDeserialize(
 
         .pointer => |ptr| {
             switch (ptr.size) {
-                .One => {
+                .one => {
                     const pointer = try allocator.?.create(ptr.child);
                     errdefer allocator.?.destroy(pointer);
 
@@ -350,7 +350,7 @@ fn recursiveDeserialize(
 
                     target.* = pointer;
                 },
-                .Slice => {
+                .slice => {
                     const length = std.math.cast(usize, try stream.readInt(u64, .little)) orelse return error.UnexpectedData;
 
                     const slice = blk: {
@@ -374,8 +374,8 @@ fn recursiveDeserialize(
 
                     target.* = slice;
                 },
-                .C => unreachable,
-                .Many => unreachable,
+                .c => unreachable,
+                .many => unreachable,
             }
         },
         .array => |arr| {
@@ -515,20 +515,20 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
         // Composite types:
         .pointer => |ptr| {
             switch (ptr.size) {
-                .One => {
+                .one => {
                     const mut_ptr = @constCast(value.*);
                     recursiveFree(allocator, ptr.child, mut_ptr);
                     allocator.destroy(mut_ptr);
                 },
-                .Slice => {
+                .slice => {
                     const mut_slice = makeMutableSlice(ptr.child, value.*, ptr.sentinel != null);
                     for (mut_slice) |*item| {
                         recursiveFree(allocator, ptr.child, item);
                     }
                     allocator.free(mut_slice);
                 },
-                .C => unreachable,
-                .Many => unreachable,
+                .c => unreachable,
+                .many => unreachable,
             }
         },
         .array => |arr| {
@@ -735,11 +735,11 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
             if (ptr.is_volatile) @compileError("Serializing volatile pointers is most likely a mistake.");
             if (ptr.sentinel != null and ptr.child != u8) @compileError("Sentinels other than u8 are not supported yet!");
             switch (ptr.size) {
-                .One => {
+                .one => {
                     hasher.update("pointer");
                     computeTypeHashInternal(hasher, ptr.child);
                 },
-                .Slice => {
+                .slice => {
                     hasher.update("slice");
                     if (ptr.sentinel) |_sentinel| {
                         const sentinelHash: *const u8 = @ptrCast(@alignCast(_sentinel));
@@ -747,8 +747,8 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
                     }
                     computeTypeHashInternal(hasher, ptr.child);
                 },
-                .C => @compileError("C-pointers are not supported"),
-                .Many => @compileError("Many-pointers are not supported"),
+                .c => @compileError("C-pointers are not supported"),
+                .many => @compileError("Many-pointers are not supported"),
             }
         },
         .array => |arr| {

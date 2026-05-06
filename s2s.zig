@@ -1,33 +1,51 @@
 const std = @import("std");
 const testing = std.testing;
+const options = @import("s2s_options");
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Public API:
+
+/// Options given to (de)serialize functions
+/// - 'override_fn' is a function name. If any struct has a function named this, (de)serialization will call it instead.
+pub const Options = struct {
+    override_fn: []const u8 = "",
+};
 
 /// Serializes the given `value: T` into the `stream`.
 /// - `stream` is a instance of `std.Io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
-pub fn serialize(stream: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
+/// - 'opt' contains optional features
+pub fn serialize(
+    stream: *std.Io.Writer,
+    comptime T: type,
+    value: T,
+    comptime opt: Options,
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
     comptime validateTopLevelType(T);
-    const type_hash = comptime computeTypeHash(T);
 
-    try stream.writeAll(type_hash[0..]);
-    try serializeRecursive(stream, T, value);
+    if (!options.skip_runtime_type_validation) {
+        const type_hash = comptime computeTypeHash(T);
+        try stream.writeAll(type_hash[0..]);
+    }
+
+    try serializeRecursive(stream, T, value, opt);
     try stream.flush();
 }
 
 /// Deserializes a value of type `T` from the `stream`.
 /// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
+/// - 'opt' contains optional features
 pub fn deserialize(
     stream: *std.Io.Reader,
     comptime T: type,
-) (std.Io.Reader.Error || error{ UnexpectedData, EndOfStream })!T {
+    comptime opt: Options,
+) (std.Io.Writer.Error || error{ UnexpectedData, EndOfStream })!T {
     comptime validateTopLevelType(T);
-    if (comptime requiresAllocationForDeserialize(T))
+    if (comptime requiresAllocationForDeserialize(T, opt))
         @compileError(@typeName(T) ++ " requires allocation to be deserialized. Use deserializeAlloc instead of deserialize!");
-    return deserializeInternal(stream, T, null) catch |err| switch (err) {
+    return deserializeInternal(stream, T, null, opt) catch |err| switch (err) {
         error.OutOfMemory => unreachable,
         else => |e| return e,
     };
@@ -38,13 +56,14 @@ pub fn deserialize(
 /// - `T` is the type to deserialize
 /// - `allocator` is an allocator require to allocate slices and pointers.
 /// Result must be freed by using `free()`.
+/// Custom override functions not yet supported for this case.
 pub fn deserializeAlloc(
     stream: *std.Io.Reader,
     comptime T: type,
     allocator: std.mem.Allocator,
 ) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
     comptime validateTopLevelType(T);
-    return try deserializeInternal(stream, T, allocator);
+    return try deserializeInternal(stream, T, allocator, .{});
 }
 
 /// Releases all memory allocated by `deserializeAlloc`.
@@ -58,7 +77,44 @@ pub fn free(allocator: std.mem.Allocator, comptime T: type, value: *T) void {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Implementation:
 
-fn serializeRecursive(stream: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
+/// Try to get the entry type of the unmanaged hash map, if it is one.
+/// Return NULL if it's not an unmanaged hash map.
+fn findHashMapEntryType(comptime T: type) ?type {
+    return if (
+        @hasDecl(T, "Entry") and
+        @hasField(T.Entry, "key_ptr") and
+        @hasField(T.Entry, "value_ptr")
+    ) T.Entry else null;
+}
+
+/// Serialize an unmanaged hash map.
+fn serializeMap(
+    stream: *std.Io.Writer,
+    comptime T: type,
+    value: T,
+    comptime opt: Options,
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
+    // Serialize the map size.
+    if (@hasField(T, "size")) {
+        try serializeRecursive(stream, u32, value.size, opt);
+    } else if (@hasDecl(T, "count")) {
+        if (value.count() > std.math.maxInt(u32)) return error.MapTooLarge;
+        try serializeRecursive(stream, u32, @as(u32, @intCast(value.count())), opt);
+    } else @compileError("unsupported map type");
+
+    // Serialize each entry.
+    var iterator = value.iterator();
+    while (iterator.next()) |entry| {
+        try serializeRecursive(stream, T.Entry, entry, opt);
+    }
+}
+
+fn serializeRecursive(
+    stream: *std.Io.Writer,
+    comptime T: type,
+    value: T,
+    comptime opt: Options,
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
         .void => {}, // no data
@@ -80,16 +136,15 @@ fn serializeRecursive(stream: *std.Io.Writer, comptime T: type, value: T) std.Io
             }
         },
         .pointer => |ptr| {
-            if (ptr.sentinel() != null) @compileError("Sentinels are not supported yet!");
             switch (ptr.size) {
-                .one => try serializeRecursive(stream, ptr.child, value.*),
+                .one => try serializeRecursive(stream, ptr.child, value.*, opt),
                 .slice => {
                     try stream.writeInt(u64, value.len, .little);
                     if (ptr.child == u8) {
                         try stream.writeAll(value);
                     } else {
                         for (value) |item| {
-                            try serializeRecursive(stream, ptr.child, item);
+                            try serializeRecursive(stream, ptr.child, item, opt);
                         }
                     }
                 },
@@ -102,23 +157,44 @@ fn serializeRecursive(stream: *std.Io.Writer, comptime T: type, value: T) std.Io
                 try stream.writeAll(&value);
             } else {
                 for (value) |item| {
-                    try serializeRecursive(stream, arr.child, item);
+                    try serializeRecursive(stream, arr.child, item, opt);
                 }
             }
-            if (arr.sentinel() != null) @compileError("Sentinels are not supported yet!");
         },
         .@"struct" => |str| {
+            if (opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) {
+                try @field(T, opt.override_fn)(value, stream);
+                return;
+            }
+
+            // Try to detect a structure like std.HashMapUnmanaged(T).
+            if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
+                // Try to serialize an unmanaged hash map type from the unmanaged field.
+                if (comptime findHashMapEntryType(std.meta.fields(T)[unmanagedField].type) != null) {
+                    try serializeMap(stream, std.meta.fields(T)[unmanagedField].type, value.unmanaged, opt);
+                    // Serialized the map type, nothing more to do.
+                    return;
+                }
+            } else {
+                // Try to serialize the provided type as an unmanaged hash map type.
+                if (comptime findHashMapEntryType(T) != null) {
+                    try serializeMap(stream, T, value.unmanaged, opt);
+                    // Serialized the map type, nothing more to do.
+                    return;
+                }
+            }
+
             // we can safely ignore the struct layout here as we will serialize the data by field order,
             // instead of memory representation
 
             inline for (str.fields) |fld| {
-                try serializeRecursive(stream, fld.type, @field(value, fld.name));
+                try serializeRecursive(stream, fld.type, @field(value, fld.name), opt);
             }
         },
-        .optional => |opt| {
+        .optional => |optional| {
             if (value) |item| {
                 try stream.writeInt(u8, 1, .little);
-                try serializeRecursive(stream, opt.child, item);
+                try serializeRecursive(stream, optional.child, item, opt);
             } else {
                 try stream.writeInt(u8, 0, .little);
             }
@@ -126,10 +202,10 @@ fn serializeRecursive(stream: *std.Io.Writer, comptime T: type, value: T) std.Io
         .error_union => |eu| {
             if (value) |item| {
                 try stream.writeInt(u8, 1, .little);
-                try serializeRecursive(stream, eu.payload, item);
+                try serializeRecursive(stream, eu.payload, item, opt);
             } else |item| {
                 try stream.writeInt(u8, 0, .little);
-                try serializeRecursive(stream, eu.error_set, item);
+                try serializeRecursive(stream, eu.error_set, item, opt);
             }
         },
         .error_set => {
@@ -153,17 +229,17 @@ fn serializeRecursive(stream: *std.Io.Writer, comptime T: type, value: T) std.Io
 
             const active_tag = std.meta.activeTag(value);
 
-            try serializeRecursive(stream, Tag, active_tag);
+            try serializeRecursive(stream, Tag, active_tag, opt);
 
             inline for (std.meta.fields(T)) |fld| {
                 if (@field(Tag, fld.name) == active_tag) {
-                    try serializeRecursive(stream, fld.type, @field(value, fld.name));
+                    try serializeRecursive(stream, fld.type, @field(value, fld.name), opt);
                 }
             }
         },
         .vector => |vec| {
             const array: [vec.len]vec.child = value;
-            try serializeRecursive(stream, @TypeOf(array), array);
+            try serializeRecursive(stream, @TypeOf(array), array, opt);
         },
 
         // Unsupported types:
@@ -186,16 +262,19 @@ fn deserializeInternal(
     stream: *std.Io.Reader,
     comptime T: type,
     allocator: ?std.mem.Allocator,
+    comptime opt: Options,
 ) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
-    const type_hash = comptime computeTypeHash(T);
 
-    var ref_hash: [type_hash.len]u8 = undefined;
-    try stream.readSliceAll(&ref_hash);
-    if (!std.mem.eql(u8, type_hash[0..], ref_hash[0..]))
-        return error.UnexpectedData;
+    if (!options.skip_runtime_type_validation) {
+        const type_hash = comptime computeTypeHash(T);
+        var ref_hash: [type_hash.len]u8 = undefined;
+        try stream.readSliceAll(&ref_hash);
+        if (!std.mem.eql(u8, type_hash[0..], ref_hash[0..]))
+            return error.UnexpectedData;
+    }
 
     var result: T = undefined;
-    try recursiveDeserialize(stream, T, allocator, &result);
+    try recursiveDeserialize(stream, T, allocator, &result, opt);
     return result;
 }
 
@@ -204,11 +283,45 @@ fn AlignedInt(comptime T: type) type {
     return std.math.ByteAlignedInt(T);
 }
 
+fn deserializeMap(
+    stream: *std.Io.Writer,
+    comptime T: type,
+    comptime EntryType: type,
+    allocator: ?std.mem.Allocator,
+    target: *T,
+    comptime opt: Options,
+) (std.Io.Writer.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
+    // Initialize the map.
+    target.* = T.init(allocator.?);
+
+    // Read the size of the map.
+    const size = try stream.readInt(u32, .little);
+
+    // Ensure total capacity of the map, managed or not.
+    if (@hasField(T, "unmanaged")) {
+        try target.ensureTotalCapacity(size);
+    } else {
+        try target.ensureTotalCapacity(allocator.?, size);
+    }
+
+    for (0..size) |_| {
+        // Deserialize each entry and put it in the map.
+        var entry: EntryType = undefined;
+        try recursiveDeserialize(stream, EntryType, allocator, &entry, opt);
+        defer {
+            allocator.?.destroy(entry.key_ptr);
+            allocator.?.destroy(entry.value_ptr);
+        }
+        try target.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+}
+
 fn recursiveDeserialize(
     stream: *std.Io.Reader,
     comptime T: type,
     allocator: ?std.mem.Allocator,
     target: *T,
+    comptime opt: Options,
 ) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
@@ -229,27 +342,34 @@ fn recursiveDeserialize(
             @truncate(try stream.takeInt(AlignedInt(T), .little)),
 
         .pointer => |ptr| {
-            if (ptr.sentinel() != null) @compileError("Sentinels are not supported yet!");
             switch (ptr.size) {
                 .one => {
                     const pointer = try allocator.?.create(ptr.child);
                     errdefer allocator.?.destroy(pointer);
 
-                    try recursiveDeserialize(stream, ptr.child, allocator, pointer);
+                    try recursiveDeserialize(stream, ptr.child, allocator, pointer, opt);
 
                     target.* = pointer;
                 },
                 .slice => {
                     const length = std.math.cast(usize, try stream.takeInt(u64, .little)) orelse return error.UnexpectedData;
 
-                    const slice = try allocator.?.alloc(ptr.child, length);
+                    const slice = blk: {
+                        if (ptr.sentinel) |_sentinel| {
+                            // There is a sentinel, append it.
+                            const typedSentinel: *const u8 = @ptrCast(@alignCast(_sentinel));
+                            break :blk try allocator.?.allocSentinel(ptr.child, length, typedSentinel.*);
+                        } else {
+                            break :blk try allocator.?.alloc(ptr.child, length);
+                        }
+                    };
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {
                         try stream.readSliceAll(slice);
                     } else {
                         for (slice) |*item| {
-                            try recursiveDeserialize(stream, ptr.child, allocator, item);
+                            try recursiveDeserialize(stream, ptr.child, allocator, item, opt);
                         }
                     }
 
@@ -264,24 +384,46 @@ fn recursiveDeserialize(
                 try stream.readSliceAll(target);
             } else {
                 for (&target.*) |*item| {
-                    try recursiveDeserialize(stream, arr.child, allocator, item);
+                    try recursiveDeserialize(stream, arr.child, allocator, item, opt);
                 }
             }
         },
         .@"struct" => |str| {
+            if (opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) {
+                target.* = try @field(T, opt.override_fn)(stream);
+                return;
+            }
+
+            // Try to detect a structure like std.HashMapUnmanaged(T).
+            if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
+                // Try to deserialize an unmanaged hash map type from the unmanaged field.
+                if (comptime findHashMapEntryType(std.meta.fields(T)[unmanagedField].type)) |EntryType| {
+                    try deserializeMap(stream, T, EntryType, allocator, target, opt);
+                    // Deserialized the map type, nothing more to do.
+                    return;
+                }
+            } else {
+                // Try to deserialize the provided type as an unmanaged hash map type.
+                if (comptime findHashMapEntryType(T)) |EntryType| {
+                    try deserializeMap(stream, T, EntryType, allocator, target, opt);
+                    // Deserialized the map type, nothing more to do.
+                    return;
+                }
+            }
+
             // we can safely ignore the struct layout here as we will serialize the data by field order,
             // instead of memory representation
 
             inline for (str.fields) |fld| {
-                try recursiveDeserialize(stream, fld.type, allocator, &@field(target.*, fld.name));
+                try recursiveDeserialize(stream, fld.type, allocator, &@field(target.*, fld.name), opt);
             }
         },
-        .optional => |opt| {
-            const is_set = try stream.takeInt(u8, .little);
+        .optional => |optional| {
+            const is_set = try stream.readInt(u8, .little);
 
             if (is_set != 0) {
-                target.* = @as(opt.child, undefined);
-                try recursiveDeserialize(stream, opt.child, allocator, &target.*.?);
+                target.* = @as(optional.child, undefined);
+                try recursiveDeserialize(stream, optional.child, allocator, &target.*.?, opt);
             } else {
                 target.* = null;
             }
@@ -290,11 +432,11 @@ fn recursiveDeserialize(
             const is_value = try stream.takeInt(u8, .little);
             if (is_value != 0) {
                 var value: eu.payload = undefined;
-                try recursiveDeserialize(stream, eu.payload, allocator, &value);
+                try recursiveDeserialize(stream, eu.payload, allocator, &value, opt);
                 target.* = value;
             } else {
                 var err: eu.error_set = undefined;
-                try recursiveDeserialize(stream, eu.error_set, allocator, &err);
+                try recursiveDeserialize(stream, eu.error_set, allocator, &err, opt);
                 target.* = err;
             }
         },
@@ -322,12 +464,12 @@ fn recursiveDeserialize(
             const Tag = un.tag_type orelse @compileError("Untagged unions are not supported!");
 
             var active_tag: Tag = undefined;
-            try recursiveDeserialize(stream, Tag, allocator, &active_tag);
+            try recursiveDeserialize(stream, Tag, allocator, &active_tag, opt);
 
             inline for (std.meta.fields(T)) |fld| {
                 if (@field(Tag, fld.name) == active_tag) {
                     var union_value: fld.type = undefined;
-                    try recursiveDeserialize(stream, fld.type, allocator, &union_value);
+                    try recursiveDeserialize(stream, fld.type, allocator, &union_value, opt);
                     target.* = @unionInit(T, fld.name, union_value);
                     return;
                 }
@@ -337,7 +479,7 @@ fn recursiveDeserialize(
         },
         .vector => |vec| {
             var array: [vec.len]vec.child = undefined;
-            try recursiveDeserialize(stream, @TypeOf(array), allocator, &array);
+            try recursiveDeserialize(stream, @TypeOf(array), allocator, &array, opt);
             target.* = array;
         },
 
@@ -357,11 +499,11 @@ fn recursiveDeserialize(
     }
 }
 
-fn makeMutableSlice(comptime T: type, slice: []const T) []T {
+fn makeMutableSlice(comptime T: type, slice: []const T, comptime withSentinel: bool) []T {
     if (slice.len == 0) {
         return &[_]T{};
     } else {
-        return @as([*]T, @constCast(slice.ptr))[0..slice.len];
+        return @as([*]T, @constCast(slice.ptr))[0..slice.len + (if (withSentinel) 1 else 0)];
     }
 }
 
@@ -379,7 +521,7 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
                     allocator.destroy(mut_ptr);
                 },
                 .slice => {
-                    const mut_slice = makeMutableSlice(ptr.child, value.*);
+                    const mut_slice = makeMutableSlice(ptr.child, value.*, ptr.sentinel != null);
                     for (mut_slice) |*item| {
                         recursiveFree(allocator, ptr.child, item);
                     }
@@ -395,6 +537,35 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
             }
         },
         .@"struct" => |str| {
+            // Try to detect a structure like std.HashMapUnmanaged(T).
+            if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
+                // Try to deinitialize an unmanaged hash map type from the unmanaged field.
+                if (comptime findHashMapEntryType(std.meta.fields(T)[unmanagedField].type) != null) {
+                    // Free keys / values.
+                    var iterator = value.iterator();
+                    while (iterator.next()) |entry| {
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).pointer.child, entry.key_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).pointer.child, entry.value_ptr);
+                    }
+                    value.deinit();
+                    // Deinitialized the map type, nothing more to do.
+                    return;
+                }
+            } else {
+                // Try to deinitialize the provided type as an unmanaged hash map type.
+                if (comptime findHashMapEntryType(T) != null) {
+                    // Free keys / values.
+                    var iterator = value.iterator();
+                    while (iterator.next()) |entry| {
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.key_ptr)).pointer.child, entry.key_ptr);
+                        recursiveFree(allocator, @typeInfo(@TypeOf(entry.value_ptr)).pointer.child, entry.value_ptr);
+                    }
+                    value.deinit();
+                    // Deinitialized the map type, nothing more to do.
+                    return;
+                }
+            }
+
             // we can safely ignore the struct layout here as we will serialize the data by field order,
             // instead of memory representation
 
@@ -450,18 +621,19 @@ fn recursiveFree(allocator: std.mem.Allocator, comptime T: type, value: *T) void
 }
 
 /// Returns `true` if `T` requires allocation to be deserialized.
-fn requiresAllocationForDeserialize(comptime T: type) bool {
+fn requiresAllocationForDeserialize(comptime T: type, comptime opt: Options) bool {
+    if (@typeInfo(T) == .@"struct" and opt.override_fn.len > 0 and (@hasDecl(T, opt.override_fn))) return false;
     switch (@typeInfo(T)) {
         .pointer => return true,
         .@"struct", .@"union" => {
             inline for (comptime std.meta.fields(T)) |fld| {
-                if (requiresAllocationForDeserialize(fld.type)) {
+                if (requiresAllocationForDeserialize(fld.type, opt)) {
                     return true;
                 }
             }
             return false;
         },
-        .error_union => |eu| return requiresAllocationForDeserialize(eu.payload),
+        .error_union => |eu| return requiresAllocationForDeserialize(eu.payload, opt),
         else => return false,
     }
 }
@@ -531,6 +703,23 @@ fn getSortedEnumNames(comptime T: type) []const []const u8 {
     }
 }
 
+/// Try to compute a map type hash.
+/// Return false if the detected type is not a map.
+fn computeMapTypeHash(hasher: *TypeHashFn, comptime T: type) bool {
+    if (@hasDecl(T, "KV") and
+        @hasField(T.KV, "key") and
+        @hasField(T.KV, "value")) {
+        // We can read the key-value type declaration.
+        hasher.update("map");
+        hasher.update(@typeName(std.meta.fields(T.KV)[std.meta.fieldIndex(T.KV, "key").?].type));
+        hasher.update(@typeName(std.meta.fields(T.KV)[std.meta.fieldIndex(T.KV, "value").?].type));
+        return true;
+    } else {
+        // No key-value type declaration, probably not a map.
+        return false;
+    }
+}
+
 fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
     @setEvalBranchQuota(10_000);
     switch (@typeInfo(T)) {
@@ -551,7 +740,7 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
         },
         .pointer => |ptr| {
             if (ptr.is_volatile) @compileError("Serializing volatile pointers is most likely a mistake.");
-            if (ptr.sentinel() != null) @compileError("Sentinels are not supported yet!");
+            if (ptr.sentinel != null and ptr.child != u8) @compileError("Sentinels other than u8 are not supported yet!");
             switch (ptr.size) {
                 .one => {
                     hasher.update("pointer");
@@ -559,6 +748,10 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
                 },
                 .slice => {
                     hasher.update("slice");
+                    if (ptr.sentinel) |_sentinel| {
+                        const sentinelHash: *const u8 = @ptrCast(@alignCast(_sentinel));
+                        hasher.update(&[_]u8{sentinelHash.*});
+                    }
                     computeTypeHashInternal(hasher, ptr.child);
                 },
                 .c => @compileError("C-pointers are not supported"),
@@ -566,11 +759,29 @@ fn computeTypeHashInternal(hasher: *TypeHashFn, comptime T: type) void {
             }
         },
         .array => |arr| {
-            if (arr.sentinel() != null) @compileError("Sentinels are not supported yet!");
             hasher.update(&intToLittleEndianBytes(@as(u64, arr.len)));
+            if (arr.sentinel) |_sentinel| {
+                const sentinelHash: *const u8 = @ptrCast(@alignCast(_sentinel));
+                hasher.update(&[_]u8{sentinelHash.*});
+            }
             computeTypeHashInternal(hasher, arr.child);
         },
         .@"struct" => |str| {
+            // Try to detect a structure like std.HashMapUnmanaged(T).
+            if (std.meta.fieldIndex(T, "unmanaged")) |unmanagedField| {
+                // Try to read an unmanaged hash map type from the unmanaged field.
+                if (computeMapTypeHash(hasher, std.meta.fields(T)[unmanagedField].type)) {
+                    // Parsed the map type, nothing more to do.
+                    return;
+                }
+            } else {
+                // Try to read the provided type as an unmanaged hash map type.
+                if (computeMapTypeHash(hasher, T)) {
+                    // Parsed the map type, nothing more to do.
+                    return;
+                }
+            }
+
             // we can safely ignore the struct layout here as we will serialize the data by field order,
             // instead of memory representation
 
@@ -686,6 +897,7 @@ test "type hasher basics" {
     testSameHash([]const u8, []const u8);
     testSameHash([]const u8, []u8);
     testSameHash([]const u8, []u8);
+    testSameHash([:0]const u8, [:0]u8);
     testSameHash(?*struct { a: f32, b: u16 }, ?*const struct { hello: f32, lol: u16 });
     testSameHash(enum { a, b, c }, enum { a, b, c });
     testSameHash(enum(u8) { a, b, c, _ }, enum(u8) { c, b, a, _ });
@@ -732,6 +944,10 @@ test "serialize basics" {
     try testSerialize([]const u8, "Hello, World!");
     try testSerialize(*const [3]u8, "foo");
 
+    try testSerialize([3:0]u8, "hi!".*);
+    try testSerialize([:0]const u8, "Hello, World!");
+    try testSerialize(*const [3:0]u8, "foo");
+
     try testSerialize(enum { a, b, c }, .a);
     try testSerialize(enum { a, b, c }, .b);
     try testSerialize(enum { a, b, c }, .c);
@@ -765,6 +981,24 @@ test "serialize basics" {
 
     try testSerialize(?u32, null);
     try testSerialize(?u32, 143);
+
+    // Make a string hash map and try to serialize it.
+    var strMap = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer strMap.deinit();
+    try strMap.put("mykey", "any value");
+    try strMap.put("another key", "foo bar baz");
+    try testSerialize(std.StringHashMap([]const u8), strMap);
+}
+
+fn serDesAlloc(comptime T: type, value: T) !T {
+    var data = std.ArrayList(u8).init(std.testing.allocator);
+    defer data.deinit();
+
+    try serialize(data.writer(), T, value, .{});
+
+    var stream = std.io.fixedBufferStream(data.items);
+
+    return try deserializeAlloc(stream.reader(), T, std.testing.allocator);
 }
 
 fn testSerDesAlloc(comptime T: type, value: T) !void {
@@ -829,6 +1063,10 @@ test "ser/des" {
     try testSerDesSliceContentEquality([]const u8, "Hello, World!");
     try testSerDesPtrContentEquality(*const [3]u8, "foo");
 
+    try testSerDesAlloc([3:0]u8, "hi!".*);
+    try testSerDesSliceContentEquality([:0]const u8, "Hello, World!");
+    try testSerDesPtrContentEquality(*const [3:0]u8, "foo");
+
     try testSerDesAlloc(enum { a, b, c }, .a);
     try testSerDesAlloc(enum { a, b, c }, .b);
     try testSerDesAlloc(enum { a, b, c }, .c);
@@ -863,4 +1101,19 @@ test "ser/des" {
 
     try testSerDesAlloc(?u32, null);
     try testSerDesAlloc(?u32, 143);
+
+
+    // Make a string hash map and try to serialize and deserialize it.
+    var strMap = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer strMap.deinit();
+    try strMap.put("mykey", "any value");
+    try strMap.put("another key", "foo bar baz");
+    
+    // Get the deserialized string hash map.
+    var deserializedStrMap = try serDesAlloc(std.StringHashMap([]const u8), strMap);
+    defer free(std.testing.allocator, std.StringHashMap([]const u8), &deserializedStrMap);
+
+    // Checking that the string hash map has been deserialized successfully.
+    try std.testing.expectEqualStrings("any value", deserializedStrMap.get("mykey").?);
+    try std.testing.expectEqualStrings("foo bar baz", deserializedStrMap.get("another key").?);
 }

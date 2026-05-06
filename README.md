@@ -7,7 +7,8 @@ A Zig binary serialization format and library.
 ## Features
 
 - Convert (nearly) any Zig runtime datatype to binary data and back.
-- Computes a stream signature that prevents deserialization of invalid data.
+- Optionally computes a stream signature that prevents deserialization of invalid data.
+- User can provide custom (de)serialization overrides for their structs if desired.
 - No support for graph like structures. Everything is considered to be tree data.
 
 **Unsupported types**:
@@ -20,28 +21,57 @@ A Zig binary serialization format and library.
 - Function pointers
 - Frames
 
+## Madeorsk's fork
+
+This is a fork from [`ziglibs/s2s`](https://github.com/ziglibs/s2s) which provides more features for real-world usage.
+
+- Usable with zig's dependency manager.
+- Support `[]u8` with sentinels.
+- Support hash maps.
+
+## adayoldbagel's fork
+
+This fork merges Madeorsk's feature additions with the original repo's latest updates.
+A few extra features are also in the works, according to what I find useful for my own projects:
+- Adds the ability to override the recursive (de)serialization behavior for structs with appropriate override functions implemented.
+- Adds a build option to skip runtime type hashing and validation, which shrinks the serialized stream.
+- Some more involved compression techniques are tentatively planned as well.
+- Incompatibilities in streams between build options and versions may later be solved with some sort of stream metadata header.
+- Handling of more diverse map data types is being attempted, extending Madeorsk's work.
+
+All additions to this branch are highly experimental, not at all robust, and likely not fit for public consumption at this time.
+
 ## API
 
 The library itself provides only some APIs, as most of the serialization process is not configurable.
 
 ```zig
+/// Options given to (de)serialize functions
+/// - 'override_fn' is a function name. If any struct has a function named this, (de)serialization will call it instead.
+pub const Options = struct {
+    override_fn: []const u8 = "",
+};
+
 /// Serializes the given `value: T` into the `stream`.
 /// - `stream` is a instance of `std.Io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
-fn serialize(stream: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void;
+/// - 'opt' contains optional features
+fn serialize(stream: *std.Io.Writer, comptime T: type, value: T, comptime opt: Options) (std.Io.Writer.Error || error{ MapTooLarge })!void;
 
 /// Deserializes a value of type `T` from the `stream`.
 /// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
-fn deserialize(stream: *std.Io.Reader, comptime T: type) (std.Io.Reader.Error || error{UnexpectedData,EndOfStream})!T;
+/// - 'opt' contains optional features
+fn deserialize(stream: *std.Io.Reader, comptime T: type, comptime opt: Options) (std.Io.Reader.Error || error{ UnexpectedData,EndOfStream })!T;
 
 /// Deserializes a value of type `T` from the `stream`.
 /// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
 /// - `allocator` is an allocator require to allocate slices and pointers.
 /// Result must be freed by using `free()`.
-fn deserializeAlloc(stream: *std.Io.Reader, comptime T: type, allocator: std.mem.Allocator) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory,EndOfStream })!T;
+/// Custom override functions not yet supported for this case.
+fn deserializeAlloc(stream: *std.Io.Reader, comptime T: type, allocator: std.mem.Allocator) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T;
 
 /// Releases all memory allocated by `deserializeAlloc`.
 /// - `allocator` is the allocator passed to `deserializeAlloc`.
@@ -50,18 +80,34 @@ fn deserializeAlloc(stream: *std.Io.Reader, comptime T: type, allocator: std.mem
 fn free(allocator: std.mem.Allocator, comptime T: type, value: T) void;
 ```
 
-## Usage and Development
+If you wish to add custom override (de)serialization functions to a struct, you might consider the following example.
 
-### Adding the library
+> **_NOTE:_**  This example is only meant to demonstrate syntax and the potential signatures of override functions.
+It does not represent a typical use case where override functions would be useful.
 
-Just add the `s2s.zig` as a package to your Zig project. It has no external dependencies.
+```zig
+pub const MyStruct = struct {
+    foo: u32,
 
-### Running the test suite
+    pub fn mySerialize(self: MyStruct, stream: anytype) !void {
+        try stream.writeInt(u32, self.foo, .little);
+    }
+    
+    pub fn myDeserialize(stream: anytype) !MyStruct {
+        return .{ .foo = try stream.readInt(u32, .little) };
+    }
+};
 
-```sh-session
-[user@host s2s]$ zig test s2s.zig
-All 3 tests passed.
-[user@host s2s]$
+pub fn main() !void {
+    
+    // have some std.io.stream "stream"
+    
+    const original: MyStruct = .{};
+    try s2s.serialize(stream, MyStruct, original, .{ .override_fn = "mySerialize" });
+    
+    const copy = try s2s.deserialize(stream, MyStruct, .{ .override_fn = "myDeserialize" });
+    assert(original.foo == copy.foo);
+}
 ```
 
 ## Project Status

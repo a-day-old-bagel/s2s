@@ -12,16 +12,16 @@ pub const Options = struct {
 };
 
 /// Serializes the given `value: T` into the `stream`.
-/// - `stream` is a instance of `std.io.Writer`
+/// - `stream` is a instance of `std.Io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
 /// - 'opt' contains optional features
 pub fn serialize(
-    stream: anytype,
+    stream: *std.Io.Writer,
     comptime T: type,
     value: T,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
     comptime validateTopLevelType(T);
 
     if (!options.skip_runtime_type_validation) {
@@ -30,17 +30,18 @@ pub fn serialize(
     }
 
     try serializeRecursive(stream, T, value, opt);
+    try stream.flush();
 }
 
 /// Deserializes a value of type `T` from the `stream`.
-/// - `stream` is a instance of `std.io.Reader`
+/// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
 /// - 'opt' contains optional features
 pub fn deserialize(
-    stream: anytype,
+    stream: *std.Io.Reader,
     comptime T: type,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ UnexpectedData, EndOfStream })!T {
+) (std.Io.Writer.Error || error{ UnexpectedData, EndOfStream })!T {
     comptime validateTopLevelType(T);
     if (comptime requiresAllocationForDeserialize(T, opt))
         @compileError(@typeName(T) ++ " requires allocation to be deserialized. Use deserializeAlloc instead of deserialize!");
@@ -51,16 +52,16 @@ pub fn deserialize(
 }
 
 /// Deserializes a value of type `T` from the `stream`.
-/// - `stream` is a instance of `std.io.Reader`
+/// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
 /// - `allocator` is an allocator require to allocate slices and pointers.
 /// Result must be freed by using `free()`.
 /// Custom override functions not yet supported for this case.
 pub fn deserializeAlloc(
-    stream: anytype,
+    stream: *std.Io.Reader,
     comptime T: type,
     allocator: std.mem.Allocator,
-) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
+) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
     comptime validateTopLevelType(T);
     return try deserializeInternal(stream, T, allocator, .{});
 }
@@ -88,11 +89,11 @@ fn findHashMapEntryType(comptime T: type) ?type {
 
 /// Serialize an unmanaged hash map.
 fn serializeMap(
-    stream: anytype,
+    stream: *std.Io.Writer,
     comptime T: type,
     value: T,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
     // Serialize the map size.
     if (@hasField(T, "size")) {
         try serializeRecursive(stream, u32, value.size, opt);
@@ -109,11 +110,11 @@ fn serializeMap(
 }
 
 fn serializeRecursive(
-    stream: anytype,
+    stream: *std.Io.Writer,
     comptime T: type,
     value: T,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ MapTooLarge })!void {
+) (std.Io.Writer.Error || error{ MapTooLarge })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
         .void => {}, // no data
@@ -258,16 +259,16 @@ fn serializeRecursive(
 }
 
 fn deserializeInternal(
-    stream: anytype,
+    stream: *std.Io.Reader,
     comptime T: type,
     allocator: ?std.mem.Allocator,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
+) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T {
 
     if (!options.skip_runtime_type_validation) {
         const type_hash = comptime computeTypeHash(T);
         var ref_hash: [type_hash.len]u8 = undefined;
-        try stream.readNoEof(&ref_hash);
+        try stream.readSliceAll(&ref_hash);
         if (!std.mem.eql(u8, type_hash[0..], ref_hash[0..]))
             return error.UnexpectedData;
     }
@@ -283,13 +284,13 @@ fn AlignedInt(comptime T: type) type {
 }
 
 fn deserializeMap(
-    stream: anytype,
+    stream: *std.Io.Writer,
     comptime T: type,
     comptime EntryType: type,
     allocator: ?std.mem.Allocator,
     target: *T,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
+) (std.Io.Writer.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     // Initialize the map.
     target.* = T.init(allocator.?);
 
@@ -316,29 +317,29 @@ fn deserializeMap(
 }
 
 fn recursiveDeserialize(
-    stream: anytype,
+    stream: *std.Io.Reader,
     comptime T: type,
     allocator: ?std.mem.Allocator,
     target: *T,
     comptime opt: Options,
-) (@TypeOf(stream).Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
+) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     switch (@typeInfo(T)) {
         // Primitive types:
         .void => target.* = {},
-        .bool => target.* = (try stream.readByte()) != 0,
+        .bool => target.* = (try stream.takeByte()) != 0,
         .float => target.* = @bitCast(switch (T) {
-            f16 => try stream.readInt(u16, .little),
-            f32 => try stream.readInt(u32, .little),
-            f64 => try stream.readInt(u64, .little),
-            f80 => try stream.readInt(u80, .little),
-            f128 => try stream.readInt(u128, .little),
+            f16 => try stream.takeInt(u16, .little),
+            f32 => try stream.takeInt(u32, .little),
+            f64 => try stream.takeInt(u64, .little),
+            f80 => try stream.takeInt(u80, .little),
+            f128 => try stream.takeInt(u128, .little),
             else => unreachable,
         }),
 
         .int => target.* = if (T == usize)
-            std.math.cast(usize, try stream.readInt(u64, .little)) orelse return error.UnexpectedData
+            std.math.cast(usize, try stream.takeInt(u64, .little)) orelse return error.UnexpectedData
         else
-            @truncate(try stream.readInt(AlignedInt(T), .little)),
+            @truncate(try stream.takeInt(AlignedInt(T), .little)),
 
         .pointer => |ptr| {
             switch (ptr.size) {
@@ -351,7 +352,7 @@ fn recursiveDeserialize(
                     target.* = pointer;
                 },
                 .slice => {
-                    const length = std.math.cast(usize, try stream.readInt(u64, .little)) orelse return error.UnexpectedData;
+                    const length = std.math.cast(usize, try stream.takeInt(u64, .little)) orelse return error.UnexpectedData;
 
                     const slice = blk: {
                         if (ptr.sentinel) |_sentinel| {
@@ -365,7 +366,7 @@ fn recursiveDeserialize(
                     errdefer allocator.?.free(slice);
 
                     if (ptr.child == u8) {
-                        try stream.readNoEof(slice);
+                        try stream.readSliceAll(slice);
                     } else {
                         for (slice) |*item| {
                             try recursiveDeserialize(stream, ptr.child, allocator, item, opt);
@@ -380,7 +381,7 @@ fn recursiveDeserialize(
         },
         .array => |arr| {
             if (arr.child == u8) {
-                try stream.readNoEof(target);
+                try stream.readSliceAll(target);
             } else {
                 for (&target.*) |*item| {
                     try recursiveDeserialize(stream, arr.child, allocator, item, opt);
@@ -428,7 +429,7 @@ fn recursiveDeserialize(
             }
         },
         .error_union => |eu| {
-            const is_value = try stream.readInt(u8, .little);
+            const is_value = try stream.takeInt(u8, .little);
             if (is_value != 0) {
                 var value: eu.payload = undefined;
                 try recursiveDeserialize(stream, eu.payload, allocator, &value, opt);
@@ -443,7 +444,7 @@ fn recursiveDeserialize(
             // Error unions are serialized by "index of sorted name", so we
             // hash all names in the right order
             const names = comptime getSortedErrorNames(T);
-            const index = try stream.readInt(u16, .little);
+            const index = try stream.takeInt(u16, .little);
 
             switch (index) {
                 inline 0...names.len - 1 => |idx| target.* = @field(T, names[idx]),
@@ -452,9 +453,9 @@ fn recursiveDeserialize(
         },
         .@"enum" => |list| {
             const Tag = if (list.tag_type == usize) u64 else list.tag_type;
-            const tag_value: Tag = @truncate(try stream.readInt(AlignedInt(Tag), .little));
+            const tag_value: Tag = @truncate(try stream.takeInt(AlignedInt(Tag), .little));
             if (list.is_exhaustive) {
-                target.* = std.meta.intToEnum(T, tag_value) catch return error.UnexpectedData;
+                target.* = std.enums.fromInt(T, tag_value) orelse return error.UnexpectedData;
             } else {
                 target.* = @enumFromInt(tag_value);
             }
@@ -500,8 +501,7 @@ fn recursiveDeserialize(
 
 fn makeMutableSlice(comptime T: type, slice: []const T, comptime withSentinel: bool) []T {
     if (slice.len == 0) {
-        var buf: [if (withSentinel) 1 else 0]T = if (withSentinel) .{undefined} else .{};
-        return &buf;
+        return &[_]T{};
     } else {
         return @as([*]T, @constCast(slice.ptr))[0..slice.len + (if (withSentinel) 1 else 0)];
     }
@@ -657,22 +657,25 @@ fn computeTypeHash(comptime T: type) [8]u8 {
 
     return intToLittleEndianBytes(hasher.final());
 }
-
 fn getSortedErrorNames(comptime T: type) []const []const u8 {
     comptime {
         const error_set = @typeInfo(T).error_set orelse @compileError("Cannot serialize anyerror");
 
-        var sorted_names: [error_set.len][]const u8 = undefined;
-        for (error_set, 0..) |err, i| {
-            sorted_names[i] = err.name;
-        }
-
-        std.mem.sortUnstable([]const u8, &sorted_names, {}, struct {
-            fn order(ctx: void, lhs: []const u8, rhs: []const u8) bool {
-                _ = ctx;
-                return (std.mem.order(u8, lhs, rhs) == .lt);
+        const sorted_names = blk: {
+            var names: [error_set.len][]const u8 = undefined;
+            for (error_set, 0..) |err, i| {
+                names[i] = err.name;
             }
-        }.order);
+
+            std.mem.sortUnstable([]const u8, &names, {}, struct {
+                fn order(ctx: void, lhs: []const u8, rhs: []const u8) bool {
+                    _ = ctx;
+                    return (std.mem.order(u8, lhs, rhs) == .lt);
+                }
+            }.order);
+            break :blk names;
+        };
+
         return &sorted_names;
     }
 }
@@ -681,17 +684,21 @@ fn getSortedEnumNames(comptime T: type) []const []const u8 {
     comptime {
         const type_info = @typeInfo(T).@"enum";
 
-        var sorted_names: [type_info.fields.len][]const u8 = undefined;
-        for (type_info.fields, 0..) |err, i| {
-            sorted_names[i] = err.name;
-        }
-
-        std.mem.sortUnstable([]const u8, &sorted_names, {}, struct {
-            fn order(ctx: void, lhs: []const u8, rhs: []const u8) bool {
-                _ = ctx;
-                return (std.mem.order(u8, lhs, rhs) == .lt);
+        const sorted_names = blk: {
+            var names: [type_info.fields.len][]const u8 = undefined;
+            for (type_info.fields, 0..) |err, i| {
+                names[i] = err.name;
             }
-        }.order);
+
+            std.mem.sortUnstable([]const u8, &names, {}, struct {
+                fn order(ctx: void, lhs: []const u8, rhs: []const u8) bool {
+                    _ = ctx;
+                    return (std.mem.order(u8, lhs, rhs) == .lt);
+                }
+            }.order);
+            break :blk names;
+        };
+
         return &sorted_names;
     }
 }
@@ -910,10 +917,9 @@ test "type hasher basics" {
 }
 
 fn testSerialize(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
-    defer data.deinit();
+    var discarding: std.Io.Writer.Discarding = .init(&.{});
 
-    try serialize(data.writer(), T, value, .{});
+    try serialize(&discarding.writer, T, value);
 }
 
 const enable_failing_test = false;
@@ -996,42 +1002,42 @@ fn serDesAlloc(comptime T: type, value: T) !T {
 }
 
 fn testSerDesAlloc(comptime T: type, value: T) !void {
-    var data: std.ArrayList(u8) = .init(std.testing.allocator);
-    defer data.deinit();
+    var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating.deinit();
 
-    try serialize(data.writer(), T, value, .{});
+    try serialize(&allocating.writer, T, value);
 
-    var stream = std.io.fixedBufferStream(data.items);
+    var fixed: std.Io.Reader = .fixed(allocating.written());
 
-    var deserialized = try deserializeAlloc(stream.reader(), T, std.testing.allocator);
+    var deserialized = try deserializeAlloc(&fixed, T, std.testing.allocator);
     defer free(std.testing.allocator, T, &deserialized);
 
     try std.testing.expectEqual(value, deserialized);
 }
 
 fn testSerDesPtrContentEquality(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
-    defer data.deinit();
+    var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating.deinit();
 
-    try serialize(data.writer(), T, value, .{});
+    try serialize(&allocating.writer, T, value);
 
-    var stream = std.io.fixedBufferStream(data.items);
+    var fixed: std.Io.Reader = .fixed(allocating.written());
 
-    var deserialized = try deserializeAlloc(stream.reader(), T, std.testing.allocator);
+    var deserialized = try deserializeAlloc(&fixed, T, std.testing.allocator);
     defer free(std.testing.allocator, T, &deserialized);
 
     try std.testing.expectEqual(value.*, deserialized.*);
 }
 
 fn testSerDesSliceContentEquality(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
-    defer data.deinit();
+    var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating.deinit();
 
-    try serialize(data.writer(), T, value, .{});
+    try serialize(&allocating.writer, T, value);
 
-    var stream = std.io.fixedBufferStream(data.items);
+    var fixed: std.Io.Reader = .fixed(allocating.written());
 
-    var deserialized = try deserializeAlloc(stream.reader(), T, std.testing.allocator);
+    var deserialized = try deserializeAlloc(&fixed, T, std.testing.allocator);
     defer free(std.testing.allocator, T, &deserialized);
 
     try std.testing.expectEqualSlices(std.meta.Child(T), value, deserialized);

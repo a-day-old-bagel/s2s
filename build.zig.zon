@@ -4,6 +4,7 @@
     .minimum_zig_version = "0.14.0",
     .fingerprint = 0x8d8a7bec8d1a1337,
     .dependencies = .{},
+    .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",
         "s2s.zig",

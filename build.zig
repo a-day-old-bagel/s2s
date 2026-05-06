@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     }
     const options_module = options_step.createModule();
 
-    _ = b.addModule("s2s", .{
+    const s2s_module = b.addModule("s2s", .{
         .root_source_file = b.path("s2s.zig"),
         .target = target,
         .optimize = optimize,
@@ -27,9 +27,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tests = b.addTest(.{
-        .root_source_file = b.path("s2s.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = s2s_module,
     });
     tests.root_module.addImport("s2s_options", options_module);
 

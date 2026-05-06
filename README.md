@@ -53,25 +53,25 @@ pub const Options = struct {
 };
 
 /// Serializes the given `value: T` into the `stream`.
-/// - `stream` is a instance of `std.io.Writer`
+/// - `stream` is a instance of `std.Io.Writer`
 /// - `T` is the type to serialize
 /// - `value` is the instance to serialize.
 /// - 'opt' contains optional features
-fn serialize(stream: anytype, comptime T: type, value: T, comptime opt: Options) (StreamError || error{ MapTooLarge })!void;
+fn serialize(stream: *std.Io.Writer, comptime T: type, value: T, comptime opt: Options) (std.Io.Writer.Error || error{ MapTooLarge })!void;
 
 /// Deserializes a value of type `T` from the `stream`.
-/// - `stream` is a instance of `std.io.Reader`
+/// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
 /// - 'opt' contains optional features
-fn deserialize(stream: anytype, comptime T: type, comptime opt: Options) (StreamError || error{ UnexpectedData,EndOfStream })!T;
+fn deserialize(stream: *std.Io.Reader, comptime T: type, comptime opt: Options) (std.Io.Reader.Error || error{ UnexpectedData,EndOfStream })!T;
 
 /// Deserializes a value of type `T` from the `stream`.
-/// - `stream` is a instance of `std.io.Reader`
+/// - `stream` is a instance of `std.Io.Reader`
 /// - `T` is the type to deserialize
 /// - `allocator` is an allocator require to allocate slices and pointers.
 /// Result must be freed by using `free()`.
 /// Custom override functions not yet supported for this case.
-fn deserializeAlloc(stream: anytype, comptime T: type, allocator: std.mem.Allocator) (StreamError || error{ UnexpectedData, OutOfMemory, EndOfStream })!T;
+fn deserializeAlloc(stream: *std.Io.Reader, comptime T: type, allocator: std.mem.Allocator) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!T;
 
 /// Releases all memory allocated by `deserializeAlloc`.
 /// - `allocator` is the allocator passed to `deserializeAlloc`.

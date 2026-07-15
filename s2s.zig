@@ -41,7 +41,7 @@ pub fn deserialize(
     stream: *std.Io.Reader,
     comptime T: type,
     comptime opt: Options,
-) (std.Io.Writer.Error || error{ UnexpectedData, EndOfStream })!T {
+) (std.Io.Reader.Error || error{ UnexpectedData, EndOfStream })!T {
     comptime validateTopLevelType(T);
     if (comptime requiresAllocationForDeserialize(T, opt))
         @compileError(@typeName(T) ++ " requires allocation to be deserialized. Use deserializeAlloc instead of deserialize!");
@@ -290,12 +290,12 @@ fn deserializeMap(
     allocator: ?std.mem.Allocator,
     target: *T,
     comptime opt: Options,
-) (std.Io.Writer.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
+) (std.Io.Reader.Error || error{ UnexpectedData, OutOfMemory, EndOfStream })!void {
     // Initialize the map.
     target.* = T.init(allocator.?);
 
     // Read the size of the map.
-    const size = try stream.readInt(u32, .little);
+    const size = try stream.takeInt(u32, .little);
 
     // Ensure total capacity of the map, managed or not.
     if (@hasField(T, "unmanaged")) {
@@ -419,7 +419,7 @@ fn recursiveDeserialize(
             }
         },
         .optional => |optional| {
-            const is_set = try stream.readInt(u8, .little);
+            const is_set = try stream.takeInt(u8, .little);
 
             if (is_set != 0) {
                 target.* = @as(optional.child, undefined);
